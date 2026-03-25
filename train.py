@@ -15,15 +15,10 @@ import torchvision.utils as vutils
 from torch.cuda.amp import autocast, GradScaler
 
 # 수정된 model.py와 통합 Myloss.py를 임포트
-import model 
-import Myloss 
+import model
+import Myloss
 import dataloader as new_dataloader
-
-def str2bool(v):
-    if isinstance(v, bool): return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'): return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'): return False
-    else: raise argparse.ArgumentTypeError('Boolean value expected.')
+from utils import str2bool
 
 def train(opt):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,7 +37,7 @@ def train(opt):
     train_dataset = new_dataloader.LunarStereoDataset(data_path, mode='train', transform=True, img_height=opt.img_height, img_width=opt.img_width)
     train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True, collate_fn=new_dataloader.LunarStereoDataset.collate_fn)
     
-    val_dataset = new_dataloader.LunarStereoDataset(data_path, mode='val', transform=True, img_height=opt.img_height, img_width=opt.img_width)
+    val_dataset = new_dataloader.LunarStereoDataset(data_path, mode='val', transform=False, img_height=opt.img_height, img_width=opt.img_width)
     val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=opt.num_workers, pin_memory=True, collate_fn=new_dataloader.LunarStereoDataset.collate_fn)
     
     vis_indices = list(range(min(5, len(val_dataset))))
@@ -120,8 +115,9 @@ def train(opt):
             
             with autocast(enabled=(device.type == 'cuda')):
                 outputs = dimcam_model(img_l, img_r)
-                pred_l, pred_r, depth, _, _, fused_gamma_l, fused_gamma_r = outputs
-                loss, loss_dict = criterion(img_l, img_r, pred_l, pred_r, fused_gamma_l, fused_gamma_r, depth, calib_data)
+                pred_l, pred_r, depth, dpce_l, dpce_r, fused_gamma_l, fused_gamma_r = outputs
+                loss, loss_dict = criterion(img_l, img_r, pred_l, pred_r, fused_gamma_l, fused_gamma_r, depth, calib_data,
+                                            dpce_enhanced_l=dpce_l, dpce_enhanced_r=dpce_r)
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -135,7 +131,7 @@ def train(opt):
             
             global_step = epoch * len(train_loader) + i
             for key, value in loss_dict.items():
-                if value > 0: writer.add_scalar(f'Loss/{key}', value, global_step)
+                writer.add_scalar(f'Loss/{key}', value, global_step)
             writer.add_scalar('LearningRate/step', lr_scheduler.get_last_lr()[0], global_step)
 
         avg_train_loss = total_train_loss / len(train_loader)
@@ -151,8 +147,9 @@ def train(opt):
                 img_l, img_r = img_l.to(device), img_r.to(device)
                 with autocast(enabled=False):
                     outputs = dimcam_model(img_l, img_r)
-                    pred_l, pred_r, depth, _, _, fused_gamma_l, fused_gamma_r = outputs
-                    loss, _ = criterion(img_l, img_r, pred_l, pred_r, fused_gamma_l, fused_gamma_r, depth, calib_data)
+                    pred_l, pred_r, depth, dpce_l, dpce_r, fused_gamma_l, fused_gamma_r = outputs
+                    loss, _ = criterion(img_l, img_r, pred_l, pred_r, fused_gamma_l, fused_gamma_r, depth, calib_data,
+                                        dpce_enhanced_l=dpce_l, dpce_enhanced_r=dpce_r)
                 total_val_loss += loss.item()
                 val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -222,7 +219,7 @@ if __name__ == "__main__":
     parser.add_argument('--w_light', type=float, default=0.1, help='Weight for light consistency loss.')
     parser.add_argument('--w_sfp', type=float, default=0.2, help='Weight for perceptual (VGG) loss.')
     parser.add_argument('--w_gamma', type=float, default=0.001, help='Weight for gamma smoothness loss.')
-    parser.add_argument('--w_color', type=float, default=100.0, help='Weight for color ratio preservation loss (RGB mode only).')
+    parser.add_argument('--w_color', type=float, default=5.0, help='Weight for color ratio preservation loss (RGB mode only).')
 
     # 로깅 및 저장 간격
     parser.add_argument('--save_interval', type=int, default=10)

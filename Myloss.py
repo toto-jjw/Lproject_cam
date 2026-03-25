@@ -12,25 +12,23 @@ import numpy as np
 # --- 1. 기본 구성 요소 손실 ---
 
 class GradientConsistencyLoss(nn.Module):
-    """ L_stereo와 L_depth의 기본 연산 (변경 없음) """
+    """ L_stereo와 L_depth의 기본 연산 """
     def __init__(self):
         super(GradientConsistencyLoss, self).__init__()
-        kernel_left = torch.tensor([[0, 0, 0], [-1, 1, 0], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-        kernel_right = torch.tensor([[0, 0, 0], [0, 1, -1], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-        kernel_up = torch.tensor([[0, -1, 0], [0, 1, 0], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-        kernel_down = torch.tensor([[0, 0, 0], [0, 1, 0], [0, -1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-        self.kernels = [kernel_left, kernel_right, kernel_up, kernel_down]
+        self.register_buffer('kernel_left', torch.tensor([[0, 0, 0], [-1, 1, 0], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer('kernel_right', torch.tensor([[0, 0, 0], [0, 1, -1], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer('kernel_up', torch.tensor([[0, -1, 0], [0, 1, 0], [0, 0, 0]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer('kernel_down', torch.tensor([[0, 0, 0], [0, 1, 0], [0, -1, 0]], dtype=torch.float32).view(1, 1, 3, 3))
         self.pool = nn.AvgPool2d(4)
 
     def forward(self, img1, img2):
         img1_pool, img2_pool = self.pool(img1), self.pool(img2)
         total_loss = 0
-        for kernel in self.kernels:
-            kernel = kernel.to(img1.device)
+        for kernel in [self.kernel_left, self.kernel_right, self.kernel_up, self.kernel_down]:
             grad1 = F.conv2d(img1_pool, kernel.repeat(img1.shape[1], 1, 1, 1), padding=1, groups=img1.shape[1])
             grad2 = F.conv2d(img2_pool, kernel.repeat(img2.shape[1], 1, 1, 1), padding=1, groups=img2.shape[1])
             total_loss += F.l1_loss(torch.abs(grad1), torch.abs(grad2))
-        return total_loss / len(self.kernels)
+        return total_loss / 4
 
 # --- 2. ★★★ DPCE-Net 방식의 손실 함수들로 교체 ★★★ ---
 
@@ -56,8 +54,8 @@ class LightConsistencyLoss(nn.Module):
                 img = enhanced_image[i]
                 max_y, max_x = H - self.patch_size, W - self.patch_size
                 for _ in range(self.num_patches):
-                    rand_y = random.randint(0, max_y)
-                    rand_x = random.randint(0, max_x)
+                    rand_y = torch.randint(0, max_y + 1, (1,)).item()
+                    rand_x = torch.randint(0, max_x + 1, (1,)).item()
                     patch = img[:, rand_y : rand_y + self.patch_size, rand_x : rand_x + self.patch_size]
                     all_sampled_patches.append(patch)
             sampled_patches_tensor = torch.stack(all_sampled_patches, dim=0)
@@ -85,14 +83,24 @@ class SpatialConsistencyLoss(nn.Module):
         return self.loss_fn(features_input, features_enhanced)
 
 class GammaSmoothnessLoss(nn.Module):
-    """ L_gamma: DPCE-Net 방식 (2-pixel-gap L2 Loss) """
+    """ L_gamma: Edge-Aware Smoothness (B2) — 엣지에서는 gamma 변화 허용 """
     def __init__(self):
         super(GammaSmoothnessLoss, self).__init__()
 
-    def forward(self, gamma_map):
-        grad_x_sq = torch.pow(gamma_map[:, :, :, 2:] - gamma_map[:, :, :, :-2], 2)
-        grad_y_sq = torch.pow(gamma_map[:, :, 2:, :] - gamma_map[:, :, :-2, :], 2)
-        return (torch.mean(grad_x_sq) + torch.mean(grad_y_sq)) / 2
+    def forward(self, gamma_map, image=None):
+        gamma_grad_x = torch.pow(gamma_map[:, :, :, 2:] - gamma_map[:, :, :, :-2], 2)
+        gamma_grad_y = torch.pow(gamma_map[:, :, 2:, :] - gamma_map[:, :, :-2, :], 2)
+
+        if image is not None:
+            # B2: 이미지 gradient 기반 가중치 — 엣지에서는 smoothness 억제
+            img_grad_x = torch.abs(image[:, :, :, 2:] - image[:, :, :, :-2]).mean(dim=1, keepdim=True)
+            img_grad_y = torch.abs(image[:, :, 2:, :] - image[:, :, :-2, :]).mean(dim=1, keepdim=True)
+            weight_x = torch.exp(-10.0 * img_grad_x)
+            weight_y = torch.exp(-10.0 * img_grad_y)
+            gamma_grad_x = weight_x * gamma_grad_x
+            gamma_grad_y = weight_y * gamma_grad_y
+
+        return (torch.mean(gamma_grad_x) + torch.mean(gamma_grad_y)) / 2
 
 
 # --- ★★★ Color Ratio Preservation Loss (원본 색상 비율 유지) ★★★ ---
@@ -167,8 +175,9 @@ class DimCamLoss(nn.Module):
         except (KeyError, TypeError, AttributeError, np.linalg.LinAlgError):
             return torch.eye(3, device=device)
 
-    def forward(self, original_l, original_r, pred_l, pred_r, 
-                fused_gamma_l, fused_gamma_r, depth_map, calib_data):
+    def forward(self, original_l, original_r, pred_l, pred_r,
+                fused_gamma_l, fused_gamma_r, depth_map, calib_data,
+                dpce_enhanced_l=None, dpce_enhanced_r=None):
         device = pred_l.device
         
         # --- 1. Stereo Consistency Loss (L_stereo) ---
@@ -202,10 +211,13 @@ class DimCamLoss(nn.Module):
         loss_light = self.loss_light(pred_l) + self.loss_light(pred_r)
 
         # --- 4. Spatial Consistency Loss (L_sfp) ---
-        loss_sfp = self.loss_sfp(original_l, pred_l) + self.loss_sfp(original_r, pred_r)
+        # B1: dpce_enhanced 기준으로 비교 (어두운 원본 VGG features ≈ 0 문제 해결)
+        sfp_ref_l = dpce_enhanced_l if dpce_enhanced_l is not None else original_l
+        sfp_ref_r = dpce_enhanced_r if dpce_enhanced_r is not None else original_r
+        loss_sfp = self.loss_sfp(sfp_ref_l, pred_l) + self.loss_sfp(sfp_ref_r, pred_r)
 
-        # --- 5. Gamma Smoothness Loss (L_gamma) ---
-        loss_gamma = self.loss_gamma(fused_gamma_l) + self.loss_gamma(fused_gamma_r)
+        # --- 5. Gamma Smoothness Loss (L_gamma) — B2: edge-aware ---
+        loss_gamma = self.loss_gamma(fused_gamma_l, original_l) + self.loss_gamma(fused_gamma_r, original_r)
 
         # --- 6. ★★★ Color Ratio Preservation Loss ★★★ ---
         loss_color = torch.tensor(0.0, device=device)

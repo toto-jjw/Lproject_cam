@@ -17,16 +17,10 @@ from tqdm import tqdm
 import torchvision.utils as vutils
 from torch.cuda.amp import autocast, GradScaler
 
-import model 
-import Myloss 
+import model
+import Myloss
 import dataloader as new_dataloader
-
-
-def str2bool(v):
-    if isinstance(v, bool): return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'): return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'): return False
-    else: raise argparse.ArgumentTypeError('Boolean value expected.')
+from utils import str2bool
 
 
 class EarlyStopping:
@@ -101,9 +95,10 @@ def train_one_epoch(epoch, stage, dimcam_model, train_loader, criterion,
         
         with autocast(enabled=(device.type == 'cuda')):
             outputs = dimcam_model(img_l, img_r)
-            pred_l, pred_r, depth, _, _, fused_gamma_l, fused_gamma_r = outputs
-            loss, loss_dict = criterion(img_l, img_r, pred_l, pred_r, 
-                                        fused_gamma_l, fused_gamma_r, depth, calib_data)
+            pred_l, pred_r, depth, dpce_l, dpce_r, fused_gamma_l, fused_gamma_r = outputs
+            loss, loss_dict = criterion(img_l, img_r, pred_l, pred_r,
+                                        fused_gamma_l, fused_gamma_r, depth, calib_data,
+                                        dpce_enhanced_l=dpce_l, dpce_enhanced_r=dpce_r)
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -124,8 +119,7 @@ def train_one_epoch(epoch, stage, dimcam_model, train_loader, criterion,
         
         global_step = global_epoch * len(train_loader) + i
         for key, value in loss_dict.items():
-            if isinstance(value, float) and value > 0:
-                writer.add_scalar(f'Loss/{key}', value, global_step)
+            writer.add_scalar(f'Loss/{key}', value, global_step)
         writer.add_scalar('LearningRate/step', current_lr, global_step)
         writer.add_scalar('Stage', stage, global_step)
 
@@ -144,9 +138,10 @@ def validate(epoch, stage, dimcam_model, val_loader, criterion, device, writer, 
             
             with autocast(enabled=False):
                 outputs = dimcam_model(img_l, img_r)
-                pred_l, pred_r, depth, _, _, fused_gamma_l, fused_gamma_r = outputs
-                loss, _ = criterion(img_l, img_r, pred_l, pred_r, 
-                                   fused_gamma_l, fused_gamma_r, depth, calib_data)
+                pred_l, pred_r, depth, dpce_l, dpce_r, fused_gamma_l, fused_gamma_r = outputs
+                loss, _ = criterion(img_l, img_r, pred_l, pred_r,
+                                   fused_gamma_l, fused_gamma_r, depth, calib_data,
+                                   dpce_enhanced_l=dpce_l, dpce_enhanced_r=dpce_r)
             total_val_loss += loss.item()
             val_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -222,7 +217,7 @@ def train_2stage(opt):
     )
     
     val_dataset = new_dataloader.LunarStereoDataset(
-        data_path, mode='val', transform=True, 
+        data_path, mode='val', transform=False,
         img_height=opt.img_height, img_width=opt.img_width
     )
     val_loader = DataLoader(

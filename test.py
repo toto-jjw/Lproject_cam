@@ -7,15 +7,9 @@ import os
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# 최종 model, dataloader 임포트
 import model
 import dataloader as new_dataloader
-
-def str2bool(v):
-    if isinstance(v, bool): return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'): return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'): return False
-    else: raise argparse.ArgumentTypeError('Boolean value expected.')
+from utils import str2bool
 
 def test(opt):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,6 +23,7 @@ def test(opt):
     print("Initializing DimCamEnhancer model (NAFSSR-based architecture)...")
     # 학습 시 사용된 아키텍처 파라미터와 동일하게 모델을 초기화합니다.
     dimcam_model = model.DimCamEnhancer(
+        use_tiled_inference=True,
         # Wrapper 파라미터
         patch_size=opt.patch_size,
         overlap=opt.overlap,
@@ -83,7 +78,8 @@ def test(opt):
             img_l, img_r = img_l.to(device), img_r.to(device)
 
             # 모델을 그냥 호출하면 Tiled Inference가 자동으로 실행됨
-            enhanced_l, enhanced_r = dimcam_model(img_l, img_r)
+            outputs = dimcam_model(img_l, img_r)
+            enhanced_l, enhanced_r = outputs[0], outputs[1]
             
             base_name = f"{i:05d}"
             
@@ -110,9 +106,9 @@ if __name__ == "__main__":
     parser.add_argument('--overlap', type=int, default=32, help='Overlap size between patches for smooth merging.')
     
     # --- ★★★ Core 모델 하이퍼파라미터 (학습 시 설정과 반드시 일치) ★★★ ---
-    parser.add_argument('--embed_dim', type=int, default=48, help="Embedding dimension used during training.")
-    parser.add_argument('--num_blocks', type=int, default=1, help="Number of NAFBlocks used during training.")
-    parser.add_argument('--lambda_depth', type=float, default=0.0, help="Must match the value used for training.")
+    parser.add_argument('--embed_dim', type=int, default=64, help="Embedding dimension used during training.")
+    parser.add_argument('--num_blocks', type=int, default=5, help="Number of NAFBlocks used during training.")
+    parser.add_argument('--lambda_depth', type=float, default=0.1, help="Must match the value used for training.")
     
     # --- 기타 인자 ---
     parser.add_argument('--num_workers', type=int, default=4, help="Number of workers for DataLoader.")

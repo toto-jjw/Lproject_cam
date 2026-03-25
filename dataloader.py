@@ -64,6 +64,8 @@ class LunarStereoDataset(data.Dataset):
         else:
             print(f"Found {len(self.image_files_and_calib)} image pairs for mode '{self.mode}'.")
 
+        self._calib_cache = {}
+
     def _load_calib_data_cv(self, extr_path, intr_l_path, intr_r_path):
         calib_data = {}
         try:
@@ -101,16 +103,34 @@ class LunarStereoDataset(data.Dataset):
         left_path, right_path, extr_path, intr_l_path, intr_r_path = self.image_files_and_calib[index]
         img_l = Image.open(left_path).convert('RGB')
         img_r = Image.open(right_path).convert('RGB')
-        calibration_data = self._load_calib_data_cv(extr_path, intr_l_path, intr_r_path)
+        cache_key = (extr_path, intr_l_path, intr_r_path)
+        if cache_key not in self._calib_cache:
+            self._calib_cache[cache_key] = self._load_calib_data_cv(extr_path, intr_l_path, intr_r_path)
+        calibration_data = self._calib_cache[cache_key]
         if self.apply_transform:
             if self.mode == 'train':
                 resize = T.Resize((self.img_height, self.img_width), T.InterpolationMode.BICUBIC)
                 img_l, img_r = resize(img_l), resize(img_r)
                 if random.random() > 0.5:
                     img_l, img_r = T.functional.hflip(img_r), T.functional.hflip(img_l)
-                color_jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
-                img_l = color_jitter(img_l)
-                img_r = color_jitter(img_r)
+                fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = \
+                    T.ColorJitter.get_params(
+                        brightness=(0.8, 1.2), contrast=(0.8, 1.2),
+                        saturation=(0.8, 1.2), hue=(-0.1, 0.1)
+                    )
+                for fn_id in fn_idx:
+                    if fn_id == 0 and brightness_factor is not None:
+                        img_l = T.functional.adjust_brightness(img_l, brightness_factor)
+                        img_r = T.functional.adjust_brightness(img_r, brightness_factor)
+                    elif fn_id == 1 and contrast_factor is not None:
+                        img_l = T.functional.adjust_contrast(img_l, contrast_factor)
+                        img_r = T.functional.adjust_contrast(img_r, contrast_factor)
+                    elif fn_id == 2 and saturation_factor is not None:
+                        img_l = T.functional.adjust_saturation(img_l, saturation_factor)
+                        img_r = T.functional.adjust_saturation(img_r, saturation_factor)
+                    elif fn_id == 3 and hue_factor is not None:
+                        img_l = T.functional.adjust_hue(img_l, hue_factor)
+                        img_r = T.functional.adjust_hue(img_r, hue_factor)
                 to_tensor = T.ToTensor()
                 img_l, img_r = to_tensor(img_l), to_tensor(img_r)
             else:

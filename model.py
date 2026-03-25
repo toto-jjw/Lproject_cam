@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import DropPath
 
 
 # --- 1. DPCE-Net 및 헬퍼 함수 임포트 ---
@@ -101,49 +100,97 @@ class NAFBlock(nn.Module):
 
 class SCAM(nn.Module):
     """
-    Stereo Cross Attention Module (NAFSSR의 병렬/양방향 방식 적용)
-    한 번의 forward 호출로 양방향 어텐션 결과를 모두 계산합니다.
+    Stereo Cross Attention Module (NAFSSR 기반 + A4 Windowed Attention)
+    disparity_range 내에서만 attend하여 메모리 절감. 해상도 변화 없음.
     """
-    def __init__(self, c):
+    def __init__(self, c, disparity_range=64):
         super().__init__()
         self.scale = c ** -0.5
+        self.disparity_range = disparity_range
         self.norm_l = LayerNorm2d(c)
         self.norm_r = LayerNorm2d(c)
-        
-        # 양방향 계산에 필요한 모든 프로젝션 레이어 정의
-        self.q_proj = nn.Conv2d(c, c, 1) # Q는 l, r 모두에서 생성되므로 공유
-        self.k_proj = nn.Conv2d(c, c, 1) # K도 공유
-        self.v_proj = nn.Conv2d(c, c, 1) # V도 공유
-        
-        # 양방향 결과에 각각 적용될 파라미터
-        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True) # for Right-to-Left
-        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True) # for Left-to-Right
+
+        self.q_proj = nn.Conv2d(c, c, 1)
+        self.k_proj = nn.Conv2d(c, c, 1)
+        self.v_proj = nn.Conv2d(c, c, 1)
+
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
+    def _windowed_attention(self, q, k, v, W, d):
+        """
+        Windowed attention along width axis.
+        q: [B,H,W,C], k: [B,H,C,W], v: [B,H,W,C]
+        각 위치 w에서 [w-d, w+d] 범위의 key/value만 참조.
+        """
+        B, H, _, C = q.shape
+        window = 2 * d + 1
+
+        # k: [B,H,C,W] → k_padded: [B,H,C,W+2d]
+        k_padded = F.pad(k, (d, d), mode='constant', value=0)
+        # v: [B,H,W,C] → W축(dim=2) 패딩 → [B,H,W+2d,C]
+        v_padded = F.pad(v, (0, 0, d, d), mode='constant', value=0)
+
+        # Unfold to create windows
+        # k_padded [B,H,C,W+2d] → unfold on dim=-1 → [B,H,C,W,window]
+        k_windows = k_padded.unfold(-1, window, 1)  # [B,H,C,W,window]
+        # v_padded [B,H,W+2d,C] → unfold on dim=2 → [B,H,W,window,C]
+        v_windows = v_padded.unfold(2, window, 1)  # [B,H,W,window,C]
+
+        # q: [B,H,W,C] → [B,H,W,1,C]
+        q_expanded = q.unsqueeze(3)
+        # k_windows: [B,H,C,W,window] → permute → [B,H,W,C,window]
+        k_windows = k_windows.permute(0, 1, 3, 2, 4)
+
+        # attn: [B,H,W,1,C] @ [B,H,W,C,window] → [B,H,W,1,window]
+        attn = torch.matmul(q_expanded, k_windows) * self.scale
+
+        # Mask for padded positions (edge handling)
+        positions = torch.arange(W, device=q.device)
+        # For each position w, valid range is [max(0,w-d), min(W-1,w+d)]
+        window_positions = positions.unsqueeze(1) + torch.arange(-d, d+1, device=q.device).unsqueeze(0)  # [W, window]
+        mask = (window_positions >= 0) & (window_positions < W)  # [W, window]
+        mask = mask.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # [1,1,W,1,window]
+        attn = attn.masked_fill(~mask, float('-inf'))
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = attn.masked_fill(~mask, 0.0)  # NaN 방지
+
+        # output: [B,H,W,1,window] @ [B,H,W,window,C] → [B,H,W,1,C] → [B,H,W,C]
+        out = torch.matmul(attn, v_windows).squeeze(3)
+        return out
 
     def forward(self, x_l, x_r):
         B, C, H, W = x_l.shape
+        d = min(self.disparity_range, W // 2)  # W가 작으면 범위 제한
 
-        # 1. Q, K, V 생성 (공유 레이어 사용)
-        q_l = self.q_proj(self.norm_l(x_l)).permute(0, 2, 3, 1) # [B,H,W,C]
-        k_l_T = self.k_proj(self.norm_l(x_l)).permute(0, 2, 1, 3) # [B,H,C,W]
-        v_l = self.v_proj(x_l).permute(0, 2, 3, 1) # [B,H,W,C]
+        # A2: norm 결과 캐싱
+        x_l_norm = self.norm_l(x_l)
+        x_r_norm = self.norm_r(x_r)
 
-        q_r = self.q_proj(self.norm_r(x_r)).permute(0, 2, 3, 1)
-        k_r_T = self.k_proj(self.norm_r(x_r)).permute(0, 2, 1, 3)
+        q_l = self.q_proj(x_l_norm).permute(0, 2, 3, 1)  # [B,H,W,C]
+        k_l_T = self.k_proj(x_l_norm).permute(0, 2, 1, 3)  # [B,H,C,W]
+        v_l = self.v_proj(x_l).permute(0, 2, 3, 1)
+
+        q_r = self.q_proj(x_r_norm).permute(0, 2, 3, 1)
+        k_r_T = self.k_proj(x_r_norm).permute(0, 2, 1, 3)
         v_r = self.v_proj(x_r).permute(0, 2, 3, 1)
 
-        # 2. 병렬 어텐션 계산
-        # Right-to-Left: Q from Left, K/V from Right
-        attn_r2l = torch.matmul(q_l, k_r_T) * self.scale
-        F_r2l = torch.matmul(torch.softmax(attn_r2l, dim=-1), v_r) # [B,H,W,C]
+        # A4: Windowed Attention (디스패리티 범위 내만 attend)
+        if d < W // 2:
+            # Windowed mode — 메모리 절감
+            F_r2l = self._windowed_attention(q_l, k_r_T, v_r, W, d)
+            F_l2r = self._windowed_attention(q_r, k_l_T, v_l, W, d)
+        else:
+            # Full attention fallback (작은 이미지)
+            attn_r2l = torch.matmul(q_l, k_r_T) * self.scale
+            F_r2l = torch.matmul(torch.softmax(attn_r2l, dim=-1), v_r)
+            attn_l2r = torch.matmul(q_r, k_l_T) * self.scale
+            F_l2r = torch.matmul(torch.softmax(attn_l2r, dim=-1), v_l)
 
-        # Left-to-Right: Q from Right, K/V from Left
-        attn_l2r = torch.matmul(q_r, k_l_T) * self.scale
-        F_l2r = torch.matmul(torch.softmax(attn_l2r, dim=-1), v_l) # [B,H,W,C]
-        
-        # 3. 최종 출력 (튜플로 양방향 결과 모두 반환)
         delta_l = F_r2l.permute(0, 3, 1, 2) * self.beta
         delta_r = F_l2r.permute(0, 3, 1, 2) * self.gamma
-        
+
         return delta_l, delta_r
 
 
@@ -181,27 +228,24 @@ class DimCamEnhancer(TiledInferenceWrapper):
             'overlap': kwargs.get('overlap', 32)
         }
         super().__init__(**wrapper_kwargs)
-        
-        # nn.Module의 __init__을 명시적으로 호출
-        nn.Module.__init__(self)
         self.use_tiled_inference = use_tiled_inference
 
 
         # 모델의 핵심 로직 초기화
-        # kwargs에서 wrapper 관련 인자를 제거하고 전달
-        core_kwargs = {k: v for k, v in kwargs.items() if k not in wrapper_kwargs}
+        _wrapper_keys = {'patch_size', 'overlap'}
+        core_kwargs = {k: v for k, v in kwargs.items() if k not in _wrapper_keys}
         self._init_core_model(**core_kwargs)
 
     def _init_core_model(self, img_size=512, gamma_channels=3, img_channels=3,
                          embed_dim=48, num_blocks=4, lambda_depth=0.0,
-                         use_grayscale=True):  # ★ grayscale/RGB 선택 옵션
+                         use_grayscale=True, disparity_range=64):  # ★ grayscale/RGB 선택 옵션
         """ 모델의 실제 레이어들을 초기화하는 메소드 """
         self.use_grayscale = use_grayscale
         self.dce_net = DPCENet()
-        self.intro = nn.Conv2d(img_channels + gamma_channels, embed_dim, 3, 1, 1)
+        self.intro = nn.Conv2d(img_channels * 2 + gamma_channels, embed_dim, 3, 1, 1)
         self.refine_blocks_l = nn.ModuleList([NAFBlock(embed_dim) for _ in range(num_blocks)])
         self.refine_blocks_r = nn.ModuleList([NAFBlock(embed_dim) for _ in range(num_blocks)])
-        self.cross_attention = SCAM(embed_dim)
+        self.cross_attention = SCAM(embed_dim, disparity_range=disparity_range)
         self.outro = nn.Conv2d(embed_dim, gamma_channels, 3, 1, 1)
         
         self.lambda_depth = lambda_depth
@@ -228,10 +272,8 @@ class DimCamEnhancer(TiledInferenceWrapper):
         """
         모델의 핵심 연산 로직. TiledInferenceWrapper가 이 메소드를 호출합니다.
         """
-        if isinstance(self.dce_net(img_l), tuple):
-            gamma_map_l_raw, gamma_map_r_raw = self.dce_net(img_l)[1], self.dce_net(img_r)[1]
-        else:
-            gamma_map_l_raw, gamma_map_r_raw = self.dce_net(img_l), self.dce_net(img_r)
+        _, gamma_map_l_raw = self.dce_net(img_l)
+        _, gamma_map_r_raw = self.dce_net(img_r)
 
         # ★★★ Grayscale/RGB 모드 선택 ★★★
         if self.use_grayscale:
@@ -243,14 +285,13 @@ class DimCamEnhancer(TiledInferenceWrapper):
             gamma_map_l = gamma_map_l_raw
             gamma_map_r = gamma_map_r_raw
 
-        with torch.no_grad():
-            dpce_only_enhanced_l = gamma_enhance(img_l, gamma_map_l)
-            dpce_only_enhanced_r = gamma_enhance(img_r, gamma_map_r)
+        # DPCE 초기 향상 결과 (Stage 2에서 gradient flow 위해 no_grad 제거)
+        dpce_only_enhanced_l = gamma_enhance(img_l, gamma_map_l)
+        dpce_only_enhanced_r = gamma_enhance(img_r, gamma_map_r)
 
-        
-            
-        transformer_input_l = torch.cat([img_l, gamma_map_l], dim=1)
-        transformer_input_r = torch.cat([img_r, gamma_map_r], dim=1)
+        # A1: Transformer 입력에 dpce_enhanced 추가 (9ch = img + dpce_enhanced + gamma_map)
+        transformer_input_l = torch.cat([img_l, dpce_only_enhanced_l, gamma_map_l], dim=1)
+        transformer_input_r = torch.cat([img_r, dpce_only_enhanced_r, gamma_map_r], dim=1)
         
         x_l, x_r = self.intro(transformer_input_l), self.intro(transformer_input_r)
 
@@ -279,9 +320,14 @@ class DimCamEnhancer(TiledInferenceWrapper):
             gamma_l_delta = gamma_l_delta_raw
             gamma_r_delta = gamma_r_delta_raw
 
-        
-        fused_gamma_l = gamma_map_l + gamma_l_delta
-        fused_gamma_r = gamma_map_r + gamma_r_delta
+        # A3: Illumination-aware delta — 어두운 영역에 더 큰 보정
+        illum_l = img_l.mean(dim=1, keepdim=True)
+        illum_r = img_r.mean(dim=1, keepdim=True)
+        dark_mask_l = (1.0 - illum_l).clamp(0, 1)
+        dark_mask_r = (1.0 - illum_r).clamp(0, 1)
+
+        fused_gamma_l = gamma_map_l + gamma_l_delta * dark_mask_l
+        fused_gamma_r = gamma_map_r + gamma_r_delta * dark_mask_r
         
         epsilon = 1e-6
         enhanced_l = gamma_enhance(img_l, fused_gamma_l.clamp(min=epsilon))
